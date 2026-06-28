@@ -375,8 +375,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             $newsletterId = (int)$mysqli->insert_id;
             $stmt->close();
 
-            /* 2) newsletter_messages — bulk INSERT (one statement) */
-            $msgPlaceholders = implode(',', array_fill(0, count($messages), '(?, ?, ?, ?, ?)'));
+            /* 2) newsletter_messages — bulk INSERT (one statement, with version=1) */
+            $msgPlaceholders = implode(',', array_fill(0, count($messages), '(?, ?, ?, ?, ?, ?)'));
             $msgSql = "
                 INSERT INTO newsletter_messages
                     (newsletter_id, message_number, msg_type, message_text, delay_minutes)

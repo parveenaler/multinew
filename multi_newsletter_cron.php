@@ -47,9 +47,9 @@ FROM
     newsletter_settings ns
 INNER JOIN
     newsletter_queue nq ON ns.id = nq.newsletter_id
-INNER JOIN
-    newsletter_messages nm ON nq.newsletter_id = nm.newsletter_id AND nq.msg_num = nm.message_number
-JOIN
+    INNER JOIN
+    newsletter_messages nm ON nq.newsletter_id = nm.newsletter_id AND nq.msg_num = nm.message_number AND nm.version = nq.message_version
+    JOIN
     users ru ON ru.id = nq.user_id
 LEFT JOIN
     users u ON u.id = ns.fake_user_id
@@ -126,7 +126,7 @@ WHERE
 							'newsletter_id' =>  $eachDueUser['newsletter_id']
 							);
 			
-						allChatDataArray($newsletterId,$toUserId,$message, $chatData,$dueRowId);
+						allChatDataArray($newsletterId,$toUserId,$text_message, $chatData,$dueRowId);
 
 						}
 				
@@ -154,7 +154,7 @@ WHERE
 					'online_day' => $online_day,
 					'newsletter_id' =>  $eachDueUser['newsletter_id']
 					);
-				allChatDataArray($newsletterId,$toUserId,$message, $chatData,$dueRowId);
+				allChatDataArray($newsletterId,$toUserId,$text_message, $chatData,$dueRowId);
 
 				}
 
@@ -182,7 +182,7 @@ WHERE
 					'newsletter_id' =>  $eachDueUser['newsletter_id']
 					);
 
-				allChatDataArray($newsletterId,$toUserId,$message, $chatData,$dueRowId);
+				allChatDataArray($newsletterId,$toUserId,$text_message, $chatData,$dueRowId);
 			}
        
 
