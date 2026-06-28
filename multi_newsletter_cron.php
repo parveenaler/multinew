@@ -22,7 +22,7 @@ require_once('assets/includes/core.php');
 //die;
 
 
-$rowsPerCall =5000;
+$rowsPerCall =1000;
 
      $userRowsSql = "SELECT
     ns.id,
@@ -40,6 +40,7 @@ $rowsPerCall =5000;
     nq.newsletter_id,
     nq.user_id AS receiver_id,
     nq.execution_status,
+    nq.version as nq_version,
     nm.message_number,
     nm.msg_type,
     nm.message_text
@@ -48,16 +49,16 @@ FROM
 INNER JOIN
     newsletter_queue nq ON ns.id = nq.newsletter_id
 INNER JOIN
-    newsletter_messages nm ON nq.newsletter_id = nm.newsletter_id AND nq.msg_num = nm.message_number
+    newsletter_message_versions nm ON nm.newsletter_id = nq.newsletter_id AND nm.version = nq.version AND nm.message_number = nq.msg_num
 JOIN
     users ru ON ru.id = nq.user_id
 LEFT JOIN
     users u ON u.id = ns.fake_user_id
 WHERE
-   	 nq.execute_by < NOW()
-	
-	 AND 
-     nq.execution_status = 0 LIMIT ".$rowsPerCall; 
+	   nq.execute_by < NOW()
+		AND nq.chat_id IS NULL
+		 AND 
+	     nq.execution_status = 0 LIMIT ".$rowsPerCall; 
 
 
     $userRowsSqlCall = $mysqli->query($userRowsSql);
@@ -193,17 +194,14 @@ WHERE
 
         
    
-        }
-echo '<pre>test';
-
-
-            
-  echo '<pre>';
-
-   insertChatRecords();            
-    $exelapsedtime = microtime(true) - $exestarttime;    
-    echo 'Total executed time is '.$exelapsedtime.'</br>'; 
     }
+
+	}
+
+// Flush inserts
+if (!empty($allChatData)) {
+    insertChatRecords();
+}
 
 $mysqli->close();
 
@@ -290,7 +288,7 @@ $mysqli->query($sqlChat);
 	  $sql = "
 		UPDATE newsletter_queue 
 		SET chat_id = $chat_id
-		WHERE execution_status = 1 AND msg_num = $msg_num  AND newsletter_id=$newsletter_id  AND user_id =$user_id"; 
+		WHERE execution_status = 1 AND chat_id IS NULL AND msg_num = $msg_num  AND newsletter_id=$newsletter_id  AND user_id =$user_id"; 
 
 	
 
