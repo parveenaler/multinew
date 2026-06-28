@@ -1,0 +1,1356 @@
+<?php
+/**
+ * newsletterMultiManageNew.phtml — Multi-Newsletter Management Page
+ *
+ * =====================================================================
+ * PERFORMANCE FIXES
+ * =====================================================================
+ *   1. FIXED N+1 QUERY — Single LEFT JOIN with conditional aggregation
+ *   2. LAZY LOADING — Initial page loads only first 30 cards;
+ *      subsequent batches fetched via AJAX on scroll (IntersectionObserver)
+ *   3. Pre-fetched fake-user map in one query
+ *   4. Vanilla JS for hot paths (modal, edit-form, validation, infinite scroll)
+ *
+ * =====================================================================
+ * UI IMPROVEMENTS
+ * =====================================================================
+ *   - Modern card grid with infinite scroll
+ *   - Modal-based full editor with drag-and-drop reordering
+ *   - EDIT HISTORY — "History" button per card opens a timeline modal
+ *     showing every edit session: date, editor, old vs new message content
+ *   - Live reply-rate progress bars
+ *   - Status pills (Active / Stopped / Draft)
+ *   - Server-side search/filter with debounce
+ *   - Responsive grid (1 col mobile, 2 col tablet, 3 col desktop)
+ *   - Dark mode support via CSS variables
+ *   - Toast notifications + loading spinners
+ *
+ * =====================================================================
+ * RECOMMENDED MYSQL INDEXES
+ * =====================================================================
+ *   ALTER TABLE newsletter_queue
+ *     ADD INDEX ix_nq_status_reply (newsletter_id, msg_num, execution_status, replied),
+ *     ADD INDEX ix_nq_user_lookup  (newsletter_id, user_id);
+ *   ALTER TABLE newsletter_messages
+ *     ADD INDEX ix_nm_nl           (newsletter_id, message_number);
+ *   ALTER TABLE newsletter_settings
+ *     ADD INDEX ix_ns_active_id    (active, id);
+ *
+ * The edit-history table is auto-created by the AJAX endpoint on first use.
+ * =====================================================================
+ */
+
+define('NL_PAGE_SIZE', 30);
+
+global $mysqli;
+
+/* -----------------------------------------------------------------
+ * STATS — lightweight COUNT queries (not the full JOIN)
+ * ----------------------------------------------------------------- */
+$statsRow = $mysqli->query("
+    SELECT
+        COUNT(*)                    AS total,
+        SUM(CASE WHEN active = 1 THEN 1 ELSE 0 END) AS active_count,
+        COALESCE((SELECT SUM(c) FROM (
+            SELECT COUNT(*) AS c FROM newsletter_messages GROUP BY newsletter_id
+        ) sub), 0) AS total_messages
+    FROM newsletter_settings
+")->fetch_assoc();
+
+$sentReplied = $mysqli->query("
+    SELECT
+        COUNT(DISTINCT CASE WHEN execution_status = 2 THEN user_id END) AS total_sent,
+        COUNT(DISTINCT CASE WHEN replied = 1 THEN user_id END)        AS total_replied
+    FROM newsletter_queue
+")->fetch_assoc();
+
+/* -----------------------------------------------------------------
+ * FIRST BATCH — only the first NL_PAGE_SIZE newsletters
+ * ----------------------------------------------------------------- */
+$sql = "
+    SELECT
+        ns.id,
+        ns.fake_user_id,
+        ns.active,
+        ns.created_at,
+        ns.index_name,
+        ns.scheduled_time,
+        u.username AS fake_user_name,
+        u.id       AS fake_user_pk,
+        COUNT(DISTINCT nm.id) AS message_count,
+        COUNT(DISTINCT CASE WHEN nq.execution_status = 2 THEN nq.user_id END) AS total_sent,
+        COUNT(DISTINCT CASE WHEN nq.replied = 1          THEN nq.user_id END) AS total_replied,
+        COUNT(DISTINCT CASE WHEN nq.execution_status IN (0,1) THEN nq.user_id END) AS pending
+    FROM newsletter_settings ns
+    LEFT JOIN newsletter_messages nm ON nm.newsletter_id = ns.id
+    LEFT JOIN newsletter_queue     nq ON nq.newsletter_id = ns.id
+    LEFT JOIN users                 u ON u.id             = ns.fake_user_id
+    GROUP BY ns.id
+    ORDER BY ns.id DESC
+    LIMIT " . NL_PAGE_SIZE . "
+";
+
+$stmt = $mysqli->prepare($sql);
+if (!$stmt) {
+    $res = $mysqli->query($sql);
+    $newsletters = $res ? $res->fetch_all(MYSQLI_ASSOC) : [];
+} else {
+    $stmt->execute();
+    $newsletters = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    $stmt->close();
+}
+
+/* -----------------------------------------------------------------
+ * Reply rates for the first batch only
+ * ----------------------------------------------------------------- */
+$ratesByNewsletter = [];
+if ($newsletters) {
+    $ids = array_column($newsletters, 'id');
+    $placeholders = implode(',', array_fill(0, count($ids), '?'));
+    $types = str_repeat('i', count($ids));
+
+    $rateSql = "
+        SELECT
+            nq.newsletter_id,
+            nq.msg_num,
+            COUNT(DISTINCT CASE WHEN nq.execution_status = 2 THEN nq.user_id END) AS sent_users,
+            COUNT(DISTINCT CASE WHEN nq.replied = 1          THEN nq.user_id END) AS replied_users
+        FROM newsletter_queue nq
+        WHERE nq.newsletter_id IN ($placeholders)
+        GROUP BY nq.newsletter_id, nq.msg_num
+        ORDER BY nq.newsletter_id, nq.msg_num
+    ";
+    $rateStmt = $mysqli->prepare($rateSql);
+    if ($rateStmt) {
+        $rateStmt->bind_param($types, ...$ids);
+        $rateStmt->execute();
+        $rateRows = $rateStmt->get_result()->fetch_all(MYSQLI_ASSOC);
+        $rateStmt->close();
+
+        foreach ($rateRows as $r) {
+            $nid = (int)$r['newsletter_id'];
+            $sent = (int)$r['sent_users'];
+            $replied = (int)$r['replied_users'];
+            $rate = $sent > 0 ? round(($replied / $sent) * 100, 2) : 0;
+            $ratesByNewsletter[$nid][] = [
+                'msg_num'       => (int)$r['msg_num'],
+                'sent_users'    => $sent,
+                'replied_users' => $replied,
+                'reply_rate'    => $rate,
+            ];
+        }
+    }
+}
+
+/* Fake users list */
+$fkStmt = $mysqli->prepare("SELECT id, username FROM users WHERE fake = 1 ORDER BY username ASC");
+$fkStmt->execute();
+$usersFKlist = $fkStmt->get_result()->fetch_all(MYSQLI_ASSOC);
+$fkStmt->close();
+
+/* JSON for first-batch (edit/view/stop/delete actions) */
+$nlDataJson = json_encode(array_map(function($n) use ($ratesByNewsletter) {
+    return [
+        'id'            => (int)$n['id'],
+        'fake_user_id'  => (int)$n['fake_user_id'],
+        'fake_user_name'=> $n['fake_user_name'] ?? 'Unknown',
+        'active'        => (int)$n['active'],
+        'message_count' => (int)$n['message_count'],
+        'total_sent'    => (int)$n['total_sent'],
+        'total_replied' => (int)$n['total_replied'],
+        'pending'       => (int)$n['pending'],
+        'rates'         => $ratesByNewsletter[(int)$n['id']] ?? [],
+    ];
+}, $newsletters), JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT);
+
+$fkListJson = json_encode(array_map(fn($u) => ['id'=>(int)$u['id'], 'username'=>$u['username']], $usersFKlist));
+$siteUrl    = rtrim($sm['config']['site_url'] ?? '/', '/') . '/';
+
+$hasMoreInitial = (count($newsletters) >= NL_PAGE_SIZE);
+?>
+<script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+<link href="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/css/select2.min.css" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/js/select2.min.js"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/jquery-confirm/3.3.2/jquery-confirm.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jquery-confirm/3.3.2/jquery-confirm.min.js"></script>
+
+<script type="application/json" id="nl-data-json"><?= $nlDataJson ?></script>
+<script type="application/json" id="fk-users-json"><?= $fkListJson ?></script>
+<script>
+  aurl = 'newsletterMultiManageNew';
+  currentMenu = 'plugins';
+  currentMenuCollapse = 'newsletterStats';
+  const NEWSLETTERS  = JSON.parse(document.getElementById('nl-data-json').textContent);
+  const FK_USERS     = JSON.parse(document.getElementById('fk-users-json').textContent);
+  const SITE_URL     = '<?= htmlspecialchars($siteUrl, ENT_QUOTES) ?>';
+  const AJAX_URL     = SITE_URL + 'requests/newsletter_manage_ajax.php';
+  const PAGE_SIZE    = <?= NL_PAGE_SIZE ?>;
+</script>
+
+<style>
+:root {
+  --nl-primary:    #4f46e5;
+  --nl-primary-d:  #4338ca;
+  --nl-accent:     #06b6d4;
+  --nl-bg:         #f8fafc;
+  --nl-card:       #ffffff;
+  --nl-border:     #e2e8f0;
+  --nl-text:       #1e293b;
+  --nl-muted:      #64748b;
+  --nl-danger:     #ef4444;
+  --nl-success:    #22c55e;
+  --nl-warn:       #f59e0b;
+  --nl-radius:     14px;
+  --nl-shadow:     0 1px 3px rgba(15,23,42,.06), 0 1px 2px rgba(15,23,42,.04);
+  --nl-shadow-lg:  0 10px 30px rgba(15,23,42,.08), 0 4px 8px rgba(15,23,42,.04);
+}
+@media (prefers-color-scheme: dark) {
+  :root { --nl-bg:#0f172a; --nl-card:#1e293b; --nl-border:#334155; --nl-text:#f1f5f9; --nl-muted:#94a3b8; }
+}
+
+.nlm-page { padding:24px 16px 80px; color:var(--nl-text); font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; }
+.nlm-head { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:14px; margin-bottom:24px; }
+.nlm-head h1 { margin:0; font-size:1.4rem; font-weight:700; display:flex; align-items:center; gap:10px; }
+.nlm-head h1 i { color:var(--nl-primary); }
+.nlm-head__sub { color:var(--nl-muted); font-size:.88rem; margin-top:4px; }
+
+.nlm-toolbar { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:20px; }
+.nlm-search { position:relative; flex:1; min-width:220px; }
+.nlm-search input { width:100%; padding:10px 12px 10px 38px; font-size:.9rem; color:var(--nl-text); background:var(--nl-card); border:1px solid var(--nl-border); border-radius:10px; box-sizing:border-box; }
+.nlm-search input:focus { outline:0; border-color:var(--nl-primary); box-shadow:0 0 0 3px rgba(79,70,229,.12); }
+.nlm-search i { position:absolute; left:12px; top:50%; transform:translateY(-50%); color:var(--nl-muted); font-size:18px; }
+
+.nlm-stats-strip { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:14px; margin-bottom:24px; }
+.nlm-stat { background:var(--nl-card); border:1px solid var(--nl-border); border-radius:12px; padding:14px 16px; box-shadow:var(--nl-shadow); }
+.nlm-stat__label { font-size:.7rem; font-weight:600; text-transform:uppercase; letter-spacing:.05em; color:var(--nl-muted); }
+.nlm-stat__value { font-size:1.5rem; font-weight:700; margin-top:4px; }
+
+.nlm-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(300px,1fr)); gap:18px; }
+.nlm-card { background:var(--nl-card); border:1px solid var(--nl-border); border-radius:var(--nl-radius); box-shadow:var(--nl-shadow); overflow:hidden; display:flex; flex-direction:column; transition:transform .15s, box-shadow .15s; }
+.nlm-card:hover { transform:translateY(-2px); box-shadow:var(--nl-shadow-lg); }
+.nlm-card__head { padding:16px 18px; border-bottom:1px solid var(--nl-border); display:flex; align-items:flex-start; justify-content:space-between; gap:10px; }
+.nlm-card__id { font-size:.78rem; color:var(--nl-muted); font-weight:600; }
+.nlm-card__title { font-size:1rem; font-weight:700; margin-top:2px; }
+.nlm-card__body { padding:16px 18px; flex:1; }
+.nlm-card__row { display:flex; justify-content:space-between; padding:6px 0; font-size:.85rem; border-bottom:1px dashed var(--nl-border); }
+.nlm-card__row:last-child { border-bottom:none; }
+.nlm-card__row span:first-child { color:var(--nl-muted); }
+
+.nlm-rate-bar { margin-top:8px; }
+.nlm-rate-bar__head { display:flex; justify-content:space-between; font-size:.78rem; color:var(--nl-muted); margin-bottom:4px; }
+.nlm-rate-bar__track { height:6px; background:var(--nl-bg); border-radius:999px; overflow:hidden; }
+.nlm-rate-bar__fill { height:100%; background:linear-gradient(90deg,var(--nl-primary),var(--nl-accent)); border-radius:999px; transition:width .5s ease; }
+
+.nlm-status { display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:999px; font-size:.72rem; font-weight:600; text-transform:uppercase; letter-spacing:.05em; }
+.nlm-status--active   { background:rgba(34,197,94,.15);  color:var(--nl-success); }
+.nlm-status--stopped  { background:rgba(239,68,68,.15);  color:var(--nl-danger); }
+.nlm-status--draft    { background:rgba(245,158,11,.15); color:var(--nl-warn); }
+.nlm-status__dot { width:6px; height:6px; border-radius:50%; background:currentColor; }
+
+.nlm-card__foot { padding:12px 18px; background:var(--nl-bg); border-top:1px solid var(--nl-border); display:flex; gap:8px; flex-wrap:wrap; }
+.nlm-btn { display:inline-flex; align-items:center; gap:6px; padding:8px 14px; font-size:.82rem; font-weight:600; border-radius:8px; border:1px solid transparent; cursor:pointer; transition:all .15s; background:transparent; color:var(--nl-text); }
+.nlm-btn:hover { background:var(--nl-bg); }
+.nlm-btn--primary { background:var(--nl-primary); color:#fff; }
+.nlm-btn--primary:hover { background:var(--nl-primary-d); }
+.nlm-btn--danger  { background:var(--nl-danger); color:#fff; }
+.nlm-btn--danger:hover  { filter:brightness(.95); }
+.nlm-btn--warn    { background:var(--nl-warn); color:#fff; }
+.nlm-btn--ghost   { background:transparent; border-color:var(--nl-border); }
+.nlm-btn--ghost:hover { background:var(--nl-card); }
+.nlm-btn--accent  { background:var(--nl-accent); color:#fff; }
+.nlm-btn--accent:hover { filter:brightness(.92); }
+.nlm-btn i { font-size:16px; display:inline-flex; align-items:center; }
+.nlm-btn:disabled { opacity:.5; cursor:not-allowed; }
+
+.nlm-empty { grid-column:1/-1; text-align:center; padding:80px 20px; background:var(--nl-card); border:2px dashed var(--nl-border); border-radius:var(--nl-radius); }
+.nlm-empty i { font-size:48px; color:var(--nl-muted); margin-bottom:12px; }
+.nlm-empty h3 { margin:0 0 6px; color:var(--nl-text); }
+.nlm-empty p { color:var(--nl-muted); margin:0 0 16px; }
+
+/* ===== Scroll Sentinel ===== */
+.nlm-sentinel { grid-column:1/-1; display:flex; align-items:center; justify-content:center; padding:32px 20px; color:var(--nl-muted); font-size:.88rem; gap:10px; min-height:60px; }
+.nlm-sentinel i { animation:nlSpin 1s linear infinite; font-size:24px; }
+.nlm-sentinel--done { color:var(--nl-muted); opacity:.6; }
+.nlm-sentinel--done i { animation:none; font-size:20px; }
+
+/* ===== Modal ===== */
+.nlm-modal { position:fixed; inset:0; background:rgba(15,23,42,.55); z-index:99999; display:none; overflow-y:auto; padding:24px 16px; backdrop-filter:blur(4px); }
+.nlm-modal.is-open { display:block; animation:nlFade .2s ease; }
+@keyframes nlFade { from{opacity:0} to{opacity:1} }
+.nlm-modal__box { background:var(--nl-card); border-radius:16px; box-shadow:var(--nl-shadow-lg); max-width:920px; width:100%; margin:0 auto; display:flex; flex-direction:column; animation:nlSlideUp .25s ease; }
+.nlm-modal__box--wide { max-width:1060px; }
+@keyframes nlSlideUp { from{transform:translateY(20px);opacity:0} to{transform:translateY(0);opacity:1} }
+.nlm-modal__head { padding:18px 24px; border-bottom:1px solid var(--nl-border); display:flex; align-items:center; justify-content:space-between; position:sticky; top:0; background:var(--nl-card); border-radius:16px 16px 0 0; z-index:1; }
+.nlm-modal__head h2 { margin:0; font-size:1.1rem; font-weight:700; display:flex; align-items:center; gap:10px; }
+.nlm-modal__close { background:transparent; border:none; font-size:24px; color:var(--nl-muted); cursor:pointer; padding:4px; line-height:1; border-radius:6px; display:flex; align-items:center; justify-content:center; width:32px; height:32px; }
+.nlm-modal__close:hover { background:var(--nl-bg); color:var(--nl-text); }
+.nlm-modal__body { padding:24px; flex:1; overflow-y:auto; }
+.nlm-modal__foot { padding:16px 24px; border-top:1px solid var(--nl-border); display:flex; justify-content:flex-end; gap:10px; background:var(--nl-bg); border-radius:0 0 16px 16px; position:sticky; bottom:0; }
+
+.nlm-form-group { margin-bottom:18px; }
+.nlm-form-group label { display:block; font-size:.78rem; font-weight:600; color:var(--nl-muted); margin-bottom:6px; text-transform:uppercase; letter-spacing:.04em; }
+.nlm-form-group input, .nlm-form-group select { width:100%; padding:10px 12px; font-size:.9rem; color:var(--nl-text); background:var(--nl-card); border:1px solid var(--nl-border); border-radius:8px; box-sizing:border-box; }
+.nlm-form-group input:focus, .nlm-form-group select:focus { outline:0; border-color:var(--nl-primary); box-shadow:0 0 0 3px rgba(79,70,229,.12); }
+
+.nlm-msg-list { display:flex; flex-direction:column; gap:14px; }
+.nlm-msg-card { background:var(--nl-bg); border:1px solid var(--nl-border); border-radius:12px; padding:16px; }
+.nlm-msg-card.is-dragging { opacity:.5; }
+.nlm-msg-card__head { display:flex; align-items:center; gap:12px; margin-bottom:12px; flex-wrap:wrap; }
+.nlm-msg-num { width:32px; height:32px; border-radius:50%; background:var(--nl-primary); color:#fff; display:flex; align-items:center; justify-content:center; font-weight:700; font-size:.85rem; flex-shrink:0; cursor:grab; }
+.nlm-msg-card select { padding:8px 10px; border:1px solid var(--nl-border); border-radius:8px; background:var(--nl-card); color:var(--nl-text); font-size:.85rem; min-width:140px; max-width:100%; }
+.nlm-msg-card .nlm-msg-delay { display:flex; align-items:center; gap:8px; margin-left:auto; }
+.nlm-msg-card .nlm-msg-delay label { font-size:.78rem; color:var(--nl-muted); }
+.nlm-msg-card textarea { width:100%; min-height:80px; padding:10px 12px; border:1px solid var(--nl-border); border-radius:8px; background:var(--nl-card); color:var(--nl-text); font-family:inherit; font-size:.88rem; resize:vertical; }
+.nlm-msg-card textarea:focus { outline:0; border-color:var(--nl-primary); box-shadow:0 0 0 3px rgba(79,70,229,.12); }
+.nlm-file-zone { display:flex; flex-direction:column; align-items:center; justify-content:center; gap:6px; padding:20px; border:2px dashed var(--nl-border); border-radius:8px; color:var(--nl-muted); font-size:.85rem; cursor:pointer; transition:border-color .15s, background .15s; }
+.nlm-file-zone:hover { border-color:var(--nl-primary); background:rgba(79,70,229,.04); }
+.nlm-file-zone input { display:none; }
+.nlm-file-preview { margin-top:8px; }
+.nlm-file-preview img, .nl-file-preview video { max-width:160px; max-height:120px; border-radius:8px; border:1px solid var(--nl-border); }
+
+.nlm-remove-row { background:transparent; border:none; color:var(--nl-danger); cursor:pointer; padding:6px; border-radius:8px; transition:background .15s; }
+.nlm-remove-row:hover { background:rgba(239,68,68,.1); }
+.nlm-remove-row:disabled { opacity:.3; cursor:not-allowed; }
+
+.nlm-toast-wrap { position:fixed; top:20px; right:20px; z-index:9999; display:flex; flex-direction:column; gap:10px; }
+.nlm-toast { display:flex; align-items:flex-start; gap:10px; min-width:280px; max-width:380px; padding:14px 16px; background:var(--nl-card); color:var(--nl-text); border:1px solid var(--nl-border); border-left:4px solid var(--nl-primary); border-radius:10px; box-shadow:var(--nl-shadow-lg); animation:nlSlideIn .25s ease; }
+.nlm-toast--success { border-left-color:var(--nl-success); }
+.nlm-toast--error   { border-left-color:var(--nl-danger); }
+.nlm-toast--warn    { border-left-color:var(--nl-warn); }
+.nlm-toast i { font-size:20px; }
+.nlm-toast__msg { flex:1; font-size:.88rem; line-height:1.4; }
+.nlm-toast__close { background:transparent; border:none; color:var(--nl-muted); cursor:pointer; font-size:18px; line-height:1; }
+@keyframes nlSlideIn { from{opacity:0;transform:translateX(20px)} to{opacity:1;transform:translateX(0)} }
+
+/* ===== History Timeline ===== */
+.nlm-history { position:relative; padding-left:28px; }
+.nlm-history::before { content:''; position:absolute; left:11px; top:8px; bottom:8px; width:2px; background:var(--nl-border); border-radius:1px; }
+.nlm-history__entry { position:relative; margin-bottom:24px; }
+.nlm-history__entry:last-child { margin-bottom:0; }
+.nlm-history__dot { position:absolute; left:-28px; top:4px; width:22px; height:22px; border-radius:50%; background:var(--nl-accent); color:#fff; display:flex; align-items:center; justify-content:center; font-size:12px; z-index:1; box-shadow:0 0 0 4px var(--nl-card); }
+.nlm-history__meta { display:flex; align-items:center; gap:10px; margin-bottom:8px; flex-wrap:wrap; }
+.nlm-history__date { font-size:.78rem; font-weight:600; color:var(--nl-accent); }
+.nlm-history__editor { font-size:.78rem; color:var(--nl-muted); }
+.nlm-history__editor strong { color:var(--nl-text); }
+.nlm-history__change { background:var(--nl-bg); border:1px solid var(--nl-border); border-radius:10px; padding:12px 14px; margin-bottom:6px; }
+.nlm-history__change-header { display:flex; align-items:center; gap:8px; margin-bottom:8px; font-size:.78rem; }
+.nlm-history__change-badge { display:inline-flex; align-items:center; padding:2px 8px; border-radius:999px; font-size:.7rem; font-weight:600; background:rgba(79,70,229,.1); color:var(--nl-primary); }
+.nlm-history__diff { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+.nlm-history__diff-label { font-size:.72rem; font-weight:600; text-transform:uppercase; color:var(--nl-muted); margin-bottom:4px; letter-spacing:.03em; }
+.nlm-history__diff-label--old { color:var(--nl-danger); }
+.nlm-history__diff-label--new { color:var(--nl-success); }
+.nlm-history__diff-value { font-size:.85rem; padding:10px 12px; border-radius:8px; white-space:pre-wrap; word-break:break-word; max-height:200px; overflow-y:auto; line-height:1.5; }
+.nlm-history__diff-value--old { background:rgba(239,68,68,.06); border:1px solid rgba(239,68,68,.15); }
+.nlm-history__diff-value--new { background:rgba(34,197,94,.06); border:1px solid rgba(34,197,94,.15); }
+.nlm-history__empty { text-align:center; padding:48px 20px; color:var(--nl-muted); }
+.nlm-history__empty i { font-size:42px; margin-bottom:10px; display:block; }
+
+@media (max-width: 1024px) {
+  .nlm-grid { grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
+}
+@media (max-width: 768px) {
+  .nlm-grid { grid-template-columns:1fr; }
+  .nlm-modal__box { max-width:calc(100% - 32px); }
+  .nlm-msg-card__head { flex-direction:column; align-items:stretch; }
+  .nlm-msg-card .nlm-msg-delay { margin-left:0; }
+  .nlm-history__diff { grid-template-columns:1fr; }
+}
+@media (max-width: 480px) {
+  .nlm-grid { grid-template-columns: 1fr; }
+  .nlm-stats-strip { grid-template-columns: repeat(2, 1fr); }
+  .nlm-modal__box { border-radius: 12px; }
+  .nlm-modal__head, .nlm-modal__body, .nlm-modal__foot { padding-left: 16px; padding-right: 16px; }
+  .nlm-msg-card .nlm-msg-delay { width: 100%; margin-left: 0; margin-top: 8px; }
+  .nlm-msg-card select { width: 100%; min-width: 0; }
+  .nlm-head h1 { font-size: 1.15rem; }
+  .nlm-card__foot { gap:6px; }
+  .nlm-btn { padding:7px 10px; font-size:.78rem; }
+}
+</style>
+
+<div class="nlm-page container-fluid">
+
+  <!-- ========== HEADER ========== -->
+  <div class="nlm-head">
+    <div>
+      <h1><i class="material-icons">campaign</i> Multi-Message Newsletters</h1>
+      <div class="nlm-head__sub">Create, edit, and monitor sequenced newsletter campaigns</div>
+    </div>
+    <a href="?page=newsletterMulti" class="nlm-btn nlm-btn--primary">
+      <i class="material-icons">add</i> New Newsletter
+    </a>
+  </div>
+
+  <!-- ========== STATS STRIP ========== -->
+  <section class="nlm-stats-strip">
+    <div class="nlm-stat">
+      <div class="nlm-stat__label">Total Campaigns</div>
+      <div class="nlm-stat__value" id="nlmStatTotal"><?= (int)($statsRow['total'] ?? 0) ?></div>
+    </div>
+    <div class="nlm-stat">
+      <div class="nlm-stat__label">Active</div>
+      <div class="nlm-stat__value" id="nlmStatActive" style="color:var(--nl-success);">
+        <?= (int)($statsRow['active_count'] ?? 0) ?>
+      </div>
+    </div>
+    <div class="nlm-stat">
+      <div class="nlm-stat__label">Messages Queued</div>
+      <div class="nlm-stat__value" id="nlmStatMsgs">
+        <?= (int)($statsRow['total_messages'] ?? 0) ?>
+      </div>
+    </div>
+    <div class="nlm-stat">
+      <div class="nlm-stat__label">Total Sent</div>
+      <div class="nlm-stat__value" id="nlmStatSent" style="color:var(--nl-accent);">
+        <?= (int)($sentReplied['total_sent'] ?? 0) ?>
+      </div>
+    </div>
+    <div class="nlm-stat">
+      <div class="nlm-stat__label">Total Replies</div>
+      <div class="nlm-stat__value" id="nlmStatReplies" style="color:var(--nl-primary);">
+        <?= (int)($sentReplied['total_replied'] ?? 0) ?>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========== TOOLBAR ========== -->
+  <div class="nlm-toolbar">
+    <div class="nlm-search">
+      <i class="material-icons">search</i>
+      <input type="search" id="nlmSearch" placeholder="Search by ID or fake user name...">
+    </div>
+    <select id="nlmFilterStatus" class="nlm-btn nlm-btn--ghost" style="padding:10px 14px;">
+      <option value="all">All Status</option>
+      <option value="active">Active</option>
+      <option value="stopped">Stopped</option>
+    </select>
+  </div>
+
+  <!-- ========== NEWSLETTER CARDS GRID ========== -->
+  <div class="nlm-grid" id="nlmGrid">
+    <?php if (empty($newsletters)): ?>
+      <div class="nlm-empty">
+        <i class="material-icons">inbox</i>
+        <h3>No newsletters yet</h3>
+        <p>Get started by creating your first multi-message campaign.</p>
+        <a href="?page=newsletterMulti" class="nlm-btn nlm-btn--primary">
+          <i class="material-icons">add</i> Create Newsletter
+        </a>
+      </div>
+    <?php else: ?>
+      <?php foreach ($newsletters as $n):
+          $nid     = (int)$n['id'];
+          $rates   = $ratesByNewsletter[$nid] ?? [];
+          $active  = (int)$n['active'] === 1;
+      ?>
+        <div class="nlm-card"
+             data-id="<?= $nid ?>"
+             data-name="<?= htmlspecialchars(strtolower($n['fake_user_name'] ?? '')) ?>"
+             data-status="<?= $active ? 'active' : 'stopped' ?>">
+
+          <div class="nlm-card__head">
+            <div>
+              <div class="nlm-card__id">#<?= $nid ?></div>
+              <div class="nlm-card__title">
+                <?= htmlspecialchars($n['fake_user_name'] ?? 'Unknown') ?>
+              </div>
+            </div>
+            <span class="nlm-status nlm-status--<?= $active ? 'active' : 'stopped' ?>">
+              <span class="nlm-status__dot"></span><?= $active ? 'Active' : 'Stopped' ?>
+            </span>
+          </div>
+
+          <div class="nlm-card__body">
+            <div class="nlm-card__row"><span>Messages</span><strong><?= (int)$n['message_count'] ?></strong></div>
+            <div class="nlm-card__row"><span>Sent</span><strong><?= (int)$n['total_sent'] ?></strong></div>
+            <div class="nlm-card__row"><span>Replies</span><strong><?= (int)$n['total_replied'] ?></strong></div>
+            <div class="nlm-card__row"><span>Pending</span><strong><?= (int)$n['pending'] ?></strong></div>
+
+            <?php if (!empty($rates)): ?>
+              <div style="margin-top:14px;">
+                <div style="font-size:.78rem;font-weight:600;color:var(--nl-muted);margin-bottom:8px;text-transform:uppercase;letter-spacing:.04em;">Per-Message Reply Rates</div>
+                <?php foreach ($rates as $r):
+                        $pct = (int)round($r['reply_rate']);
+                        $color = $pct >= 50 ? 'var(--nl-success)' : ($pct >= 25 ? 'var(--nl-warn)' : 'var(--nl-danger)');
+                ?>
+                  <div class="nlm-rate-bar">
+                    <div class="nlm-rate-bar__head">
+                      <span>Message #<?= (int)$r['msg_num'] ?></span>
+                      <span><strong><?= $r['replied_users'] ?>/<?= $r['sent_users'] ?></strong> · <?= number_format($r['reply_rate'], 1) ?>%</span>
+                    </div>
+                    <div class="nlm-rate-bar__track">
+                      <div class="nlm-rate-bar__fill" style="width:<?= $pct ?>%;background:<?= $color ?>;"></div>
+                    </div>
+                  </div>
+                <?php endforeach; ?>
+              </div>
+            <?php endif; ?>
+          </div>
+
+          <div class="nlm-card__foot">
+            <button class="nlm-btn nlm-btn--primary" data-action="view" data-id="<?= $nid ?>">
+              <i class="material-icons">visibility</i> View
+            </button>
+            <button class="nlm-btn nlm-btn--ghost" data-action="edit" data-id="<?= $nid ?>">
+              <i class="material-icons">edit</i> Edit
+            </button>
+            <button class="nlm-btn nlm-btn--accent" data-action="history" data-id="<?= $nid ?>">
+              <i class="material-icons">history</i> History
+            </button>
+            <button class="nlm-btn nlm-btn--warn"   data-action="stop" data-id="<?= $nid ?>" <?= $active ? '' : 'disabled' ?>>
+              <i class="material-icons">pause_circle</i> Stop
+            </button>
+            <button class="nlm-btn nlm-btn--danger" data-action="delete" data-id="<?= $nid ?>">
+              <i class="material-icons">delete</i> Delete
+            </button>
+          </div>
+        </div>
+      <?php endforeach; ?>
+    <?php endif; ?>
+
+    <!-- Infinite-scroll sentinel -->
+    <div class="nlm-sentinel" id="nlmSentinel">
+      <?php if ($hasMoreInitial): ?>
+        <i class="material-icons">progress_activity</i>
+        <span>Loading more newsletters…</span>
+      <?php else: ?>
+        <span class="nlm-sentinel--done" style="display:flex;align-items:center;gap:8px;">
+          <i class="material-icons">check_circle</i>
+          All newsletters loaded
+        </span>
+      <?php endif; ?>
+    </div>
+  </div>
+</div>
+
+<!-- ============== EDIT MODAL ============== -->
+<div class="nlm-modal" id="nlmEditModal">
+  <div class="nlm-modal__box">
+    <div class="nlm-modal__head">
+      <h2><i class="material-icons" style="color:var(--nl-primary);">edit_note</i> Edit Newsletter <span id="nlmEditId" style="color:var(--nl-muted);font-weight:400;"></span></h2>
+      <button class="nlm-modal__close" data-close>&times;</button>
+    </div>
+    <div class="nlm-modal__body">
+      <form id="editNewsletterForm" enctype="multipart/form-data">
+        <input type="hidden" name="action" value="update_auto_message_multinewsletter_settings_edit">
+        <input type="hidden" name="index" id="editIndex">
+        <input type="hidden" name="newsletter_id" id="editNewsletterId">
+        <input type="hidden" name="multinewsletter_mt_message_active" id="editActive" value="1">
+
+        <div class="nlm-form-group">
+          <label for="editFakeUser">Fake User (Sender)</label>
+          <select name="multinewsletter_mt_fake_user" id="editFakeUser" class="js-example-basic-single">
+            <?php foreach ($usersFKlist as $u): ?>
+              <option value="<?= (int)$u['id'] ?>"><?= htmlspecialchars($u['username']) ?></option>
+            <?php endforeach; ?>
+          </select>
+        </div>
+
+        <div class="nlm-form-group">
+          <label>Schedule (optional)</label>
+          <input type="text" id="editSchedule" name="nlScheduleDateTime"
+                 placeholder="Send immediately (or pick a time)"
+                 data-toggle="flatpickr" data-flatpickr-mode="single"
+                 data-flatpickr-alt-input="true" data-flatpickr-enable-time="true"
+                 data-flatpickr-time-24hr="true"
+                 data-flatpickr-alt-format="Y-m-d H:i:s"
+                 data-flatpickr-date-format="Y-m-d H:i:s">
+        </div>
+
+        <div class="nlm-form-group">
+          <label>Messages <span style="color:var(--nl-muted);font-weight:400;text-transform:none;letter-spacing:0;">(drag handle to reorder)</span></label>
+          <div class="nlm-msg-list" id="editMessageRows"></div>
+          <button type="button" class="nlm-btn nlm-btn--ghost" id="addEditMessageRow" style="margin-top:12px;">
+            <i class="material-icons">add</i> Add Message
+          </button>
+        </div>
+      </form>
+    </div>
+    <div class="nlm-modal__foot">
+      <button class="nlm-btn nlm-btn--ghost" data-close>Cancel</button>
+      <button class="nlm-btn nlm-btn--primary" id="saveEditNewsletterBtn">
+        <i class="material-icons">save</i> Save Changes
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- ============== VIEW USERS MODAL ============== -->
+<div class="nlm-modal" id="nlmViewModal">
+  <div class="nlm-modal__box">
+    <div class="nlm-modal__head">
+      <h2><i class="material-icons" style="color:var(--nl-accent);">group</i> Recipients <span id="nlmViewId" style="color:var(--nl-muted);font-weight:400;"></span></h2>
+      <button class="nlm-modal__close" data-close>&times;</button>
+    </div>
+    <div class="nlm-modal__body" id="nlmViewBody">
+      <div style="text-align:center;padding:40px;">
+        <i class="material-icons" style="font-size:36px;color:var(--nl-muted);animation:nlSpin 1s linear infinite;">progress_activity</i>
+        <div style="margin-top:12px;color:var(--nl-muted);">Loading recipients…</div>
+      </div>
+    </div>
+    <div class="nlm-modal__foot">
+      <button class="nlm-btn nlm-btn--ghost" data-close>Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============== HISTORY MODAL ============== -->
+<div class="nlm-modal" id="nlmHistoryModal">
+  <div class="nlm-modal__box nlm-modal__box--wide">
+    <div class="nlm-modal__head">
+      <h2><i class="material-icons" style="color:var(--nl-accent);">history</i> Edit History <span id="nlmHistoryId" style="color:var(--nl-muted);font-weight:400;"></span></h2>
+      <button class="nlm-modal__close" data-close>&times;</button>
+    </div>
+    <div class="nlm-modal__body" id="nlmHistoryBody">
+      <div style="text-align:center;padding:40px;">
+        <i class="material-icons" style="font-size:36px;color:var(--nl-muted);animation:nlSpin 1s linear infinite;">progress_activity</i>
+        <div style="margin-top:12px;color:var(--nl-muted);">Loading edit history…</div>
+      </div>
+    </div>
+    <div class="nlm-modal__foot">
+      <button class="nlm-btn nlm-btn--ghost" data-close>Close</button>
+    </div>
+  </div>
+</div>
+
+<div class="nlm-toast-wrap" id="nlmToastWrap"></div>
+
+<script>
+(function () {
+  'use strict';
+
+  const VALID_EXTS = ['jpg','jpeg','png','gif','bmp','webp','tiff','mp4','webm','ogg','mov','avi','mkv','flv'];
+  const DELAY_OPTIONS = [
+    {label:'-- Select --', value:0},
+    ...Array.from({length:60}, (_,i)=>({label:`${i+1} Min`, value:i+1})),
+    {label:'1 Hour',  value:60},
+    {label:'3 Hours', value:180},
+    {label:'6 Hours', value:360},
+    {label:'9 Hours', value:540},
+    {label:'12 Hours',value:720},
+    {label:'1 Day',   value:1440},
+    {label:'2 Days',  value:2880},
+    {label:'3 Days',  value:4320},
+    {label:'1 Week',  value:10080},
+  ];
+
+  /* ---------- State ---------- */
+  let lazyOffset   = <?= NL_PAGE_SIZE ?>;
+  let lazyLoading  = false;
+  let lazyHasMore  = <?= $hasMoreInitial ? 'true' : 'false' ?>;
+  let currentSearch  = '';
+  let currentStatus  = 'all';
+  /* Snapshot of pre-edit state for history logging */
+  let preEditSnapshot = null;
+
+  /* ---------- Toast ---------- */
+  function toast(msg, type='info') {
+    const wrap = document.getElementById('nlmToastWrap');
+    const el = document.createElement('div');
+    el.className = `nlm-toast nlm-toast--${type}`;
+    const icon = type==='success'?'check_circle':type==='error'?'error':type==='warn'?'warning':'info';
+    const colorVar = type==='warn'?'warn':type==='error'?'danger':type==='success'?'success':'primary';
+    el.innerHTML = `
+      <i class="material-icons" style="color:var(--nl-${colorVar});">${icon}</i>
+      <div class="nlm-toast__msg">${msg}</div>
+      <button class="nlm-toast__close">&times;</button>
+    `;
+    el.querySelector('.nlm-toast__close').addEventListener('click', () => el.remove());
+    wrap.appendChild(el);
+    setTimeout(() => { el.style.opacity='0'; el.style.transform='translateX(20px)'; setTimeout(()=>el.remove(),300); }, 4500);
+  }
+  window.dislayAlert = (m) => toast(m, 'info');
+
+  /* ---------- Modal helpers ---------- */
+  /* Move all modals to <body> so they escape the MDK drawer-layout's CSS-transform
+     stacking context — transforms on a parent trap position:fixed children,
+     preventing them from covering the full viewport and the sidebar. */
+  document.querySelectorAll('.nlm-modal').forEach(m => document.body.appendChild(m));
+
+  function openModal(id) {
+    const m = document.getElementById(id);
+    /* Re-append in case something moved it back */
+    if (m.parentNode !== document.body) document.body.appendChild(m);
+    m.classList.add('is-open');
+    document.body.style.overflow = 'hidden';
+  }
+  function closeModal(id) {
+    document.getElementById(id).classList.remove('is-open');
+    document.body.style.overflow = '';
+  }
+  document.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click', () => {
+    document.querySelectorAll('.nlm-modal.is-open').forEach(m => m.classList.remove('is-open'));
+    document.body.style.overflow = '';
+  }));
+  document.querySelectorAll('.nlm-modal').forEach(m => m.addEventListener('click', e => {
+    if (e.target === m) { m.classList.remove('is-open'); document.body.style.overflow = ''; }
+  }));
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') {
+      document.querySelectorAll('.nlm-modal.is-open').forEach(m => m.classList.remove('is-open'));
+      document.body.style.overflow = '';
+    }
+  });
+
+  /* ======================================================================
+   * INFINITE SCROLL — IntersectionObserver on sentinel element
+   * ====================================================================== */
+  const grid     = document.getElementById('nlmGrid');
+  const sentinel = document.getElementById('nlmSentinel');
+
+  function setSentinelLoading(loading, done) {
+    if (done) {
+      sentinel.innerHTML = '<span style="display:flex;align-items:center;gap:8px;color:var(--nl-muted);opacity:.6;"><i class="material-icons" style="font-size:20px;">check_circle</i> All newsletters loaded</span>';
+      lazyHasMore = false;
+    } else if (loading) {
+      sentinel.innerHTML = '<i class="material-icons" style="animation:nlSpin 1s linear infinite;font-size:24px;">progress_activity</i><span>Loading more newsletters…</span>';
+    } else {
+      sentinel.innerHTML = '';
+    }
+  }
+
+  function loadMore() {
+    if (lazyLoading || !lazyHasMore) return;
+    lazyLoading = true;
+    setSentinelLoading(true);
+
+    const params = new URLSearchParams({
+      action: 'lazy_load',
+      limit:  PAGE_SIZE,
+      offset: lazyOffset,
+      search: currentSearch,
+      status: currentStatus,
+    });
+
+    fetch(AJAX_URL, { method:'POST', body: params })
+      .then(r => r.json())
+      .then(res => {
+        if (res.status !== 'success') { toast('Failed to load more', 'error'); return; }
+
+        /* Append cards before the sentinel */
+        const temp = document.createElement('div');
+        temp.innerHTML = res.html;
+        while (temp.firstChild) {
+          grid.insertBefore(temp.firstChild, sentinel);
+        }
+
+        /* Append data to NEWSLETTERS array for card actions */
+        if (res.data) res.data.forEach(d => NEWSLETTERS.push(d));
+
+        lazyOffset = res.offset;
+        lazyHasMore = res.hasMore;
+        lazyLoading = false;
+
+        if (!lazyHasMore) setSentinelLoading(false, true);
+        else setSentinelLoading(false);
+      })
+      .catch(() => {
+        toast('Network error while loading more', 'error');
+        lazyLoading = false;
+        setSentinelLoading(false);
+      });
+  }
+
+  const scrollObserver = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting && lazyHasMore && !lazyLoading) {
+        loadMore();
+      }
+    });
+  }, { rootMargin: '200px' });
+
+  scrollObserver.observe(sentinel);
+
+  /* ======================================================================
+   * SERVER-SIDE SEARCH + FILTER  (replaces client-side filtering)
+   * ====================================================================== */
+  const searchInput  = document.getElementById('nlmSearch');
+  const statusFilter = document.getElementById('nlmFilterStatus');
+  let searchDebounce;
+
+  function serverSearch() {
+    const q = searchInput.value.trim().toLowerCase();
+    const s = statusFilter.value;
+
+    /* If nothing changed, skip */
+    if (q === currentSearch && s === currentStatus) return;
+    currentSearch = q;
+    currentStatus = s;
+    lazyOffset = 0;
+    lazyHasMore = true;
+    lazyLoading = false;
+
+    /* Remove existing cards but keep sentinel */
+    grid.querySelectorAll('.nlm-card').forEach(c => c.remove());
+    /* Clear NEWSLETTERS array */
+    NEWSLETTERS.length = 0;
+
+    setSentinelLoading(true);
+
+    const params = new URLSearchParams({
+      action: 'lazy_load',
+      limit:  PAGE_SIZE,
+      offset: 0,
+      search: currentSearch,
+      status: currentStatus,
+    });
+
+    fetch(AJAX_URL, { method:'POST', body: params })
+      .then(r => r.json())
+      .then(res => {
+        if (res.status !== 'success') { toast('Search failed', 'error'); return; }
+
+        const temp = document.createElement('div');
+        temp.innerHTML = res.html;
+        while (temp.firstChild) {
+          grid.insertBefore(temp.firstChild, sentinel);
+        }
+
+        if (res.data) res.data.forEach(d => NEWSLETTERS.push(d));
+
+        lazyOffset = res.offset;
+        lazyHasMore = res.hasMore;
+
+        if (res.total === 0) {
+          grid.insertBefore(
+            Object.assign(document.createElement('div'), {
+              className: 'nlm-empty',
+              innerHTML: '<i class="material-icons">search_off</i><h3>No results found</h3><p>Try adjusting your search or filter criteria.</p>'
+            }),
+            sentinel
+          );
+          setSentinelLoading(false);
+          lazyHasMore = false;
+        } else if (!lazyHasMore) {
+          setSentinelLoading(false, true);
+        } else {
+          setSentinelLoading(false);
+        }
+      })
+      .catch(() => {
+        toast('Search failed — network error', 'error');
+        setSentinelLoading(false);
+      });
+  }
+
+  searchInput.addEventListener('input', () => {
+    clearTimeout(searchDebounce);
+    searchDebounce = setTimeout(serverSearch, 300);
+  });
+  statusFilter.addEventListener('change', serverSearch);
+
+  /* ---------- Build an edit-row ---------- */
+  function buildEditRow(num, data = {}) {
+    const row = document.createElement('div');
+    row.className = 'nlm-msg-card';
+    row.draggable = true;
+    row.dataset.msgNum = num;
+
+    const type = data.type || 'text';
+    const text = data.text || '';
+    const delay = data.delay ?? 0;
+    const img = data.image || '';
+
+    const delayOpts = DELAY_OPTIONS.map(o =>
+      `<option value="${o.value}" ${Number(delay)===o.value?'selected':''}>${o.label}</option>`
+    ).join('');
+    const typeOpts = ['text','image','text_image'].map(t =>
+      `<option value="${t}" ${t===type?'selected':''}>${t==='text_image'?'Text + File':t.charAt(0).toUpperCase()+t.slice(1)}</option>`
+    ).join('');
+
+    row.innerHTML = `
+      <div class="nlm-msg-card__head">
+        <div class="nlm-msg-num" title="Drag to reorder">${num}</div>
+        <select data-field="msg_type" name="multinewsletter_mt_msg_type_${num}">${typeOpts}</select>
+        <div class="nlm-msg-delay">
+          <label>Delay</label>
+          <select data-field="delay" name="multinewsletter_mt_${num}">${delayOpts}</select>
+        </div>
+        <button type="button" class="nlm-remove-row" title="Remove" ${num===1?'disabled':''}>
+          <i class="material-icons">delete</i>
+        </button>
+      </div>
+      <div class="nlm-msg-body" style="display:grid;grid-template-columns:1fr;gap:10px;">
+        <textarea data-field="message" name="multinewsletter_mt_message_${num}"
+                  placeholder="Type your message..." style="display:${type==='image'?'none':'block'};">${text}</textarea>
+        <label class="nlm-file-zone" style="display:${type==='text'?'none':'flex'};">
+          <i class="material-icons" style="color:var(--nl-muted);">cloud_upload</i>
+          <span>Click to upload image / video</span>
+          <input type="file" data-field="file" name="multinewsletter_mt_file_${num}" accept="image/*,video/*">
+          <input type="hidden" data-field="file_hidden" name="multinewsletter_mt_file_${num}_hidden" value="${img}">
+        </label>
+        <div class="nlm-file-preview" data-field="preview"></div>
+      </div>
+    `;
+
+    const typeSel = row.querySelector('[data-field="msg_type"]');
+    const fileInput = row.querySelector('[data-field="file"]');
+    const fileZone = row.querySelector('.nlm-file-zone');
+    const textarea = row.querySelector('[data-field="message"]');
+    const previewBox = row.querySelector('[data-field="preview"]');
+
+    typeSel.addEventListener('change', () => {
+      const v = typeSel.value;
+      textarea.style.display = (v === 'image') ? 'none' : 'block';
+      fileZone.style.display = (v === 'text') ? 'none' : 'flex';
+    });
+
+    fileInput.addEventListener('change', () => {
+      const f = fileInput.files[0];
+      if (!f) return;
+      const ext = f.name.split('.').pop().toLowerCase();
+      if (!VALID_EXTS.includes(ext)) { toast(`Invalid file type: .${ext}`, 'error'); fileInput.value=''; return; }
+      const url = URL.createObjectURL(f);
+      if (f.type.startsWith('image/'))      previewBox.innerHTML = `<img src="${url}" alt="preview">`;
+      else if (f.type.startsWith('video/')) previewBox.innerHTML = `<video src="${url}" controls></video>`;
+      else                                  previewBox.innerHTML = `<div style="font-size:.82rem;color:var(--nl-muted);">${f.name}</div>`;
+    });
+
+    if (img) {
+      const ext = img.split('.').pop().toLowerCase();
+      const fullUrl = (SITE_URL + 'requests/' + img).replace(/\/+/g,'/');
+      if (['jpg','jpeg','png','gif','bmp','webp','tiff'].includes(ext)) {
+        previewBox.innerHTML = `<img src="${fullUrl}" alt="preview"><div style="font-size:.78rem;color:var(--nl-muted);margin-top:4px;">Current: ${img}</div>`;
+      } else {
+        previewBox.innerHTML = `<video src="${fullUrl}" controls></video><div style="font-size:.78rem;color:var(--nl-muted);margin-top:4px;">Current: ${img}</div>`;
+      }
+    }
+
+    return row;
+  }
+
+  function reindexEditRows() {
+    const rows = document.querySelectorAll('#editMessageRows .nlm-msg-card');
+    rows.forEach((row, i) => {
+      const num = i + 1;
+      row.dataset.msgNum = num;
+      row.querySelector('.nlm-msg-num').textContent = num;
+      row.querySelector('[data-field="msg_type"]').name = `multinewsletter_mt_msg_type_${num}`;
+      row.querySelector('[data-field="message"]').name  = `multinewsletter_mt_message_${num}`;
+      row.querySelector('[data-field="file"]').name     = `multinewsletter_mt_file_${num}`;
+      row.querySelector('[data-field="file_hidden"]').name = `multinewsletter_mt_file_${num}_hidden`;
+      row.querySelector('[data-field="delay"]').name    = `multinewsletter_mt_${num}`;
+      const rmBtn = row.querySelector('.nlm-remove-row');
+      rmBtn.disabled = (num === 1);
+    });
+  }
+
+  /* ---------- DnD on edit rows ---------- */
+  let dragSrc = null;
+  const editList = document.getElementById('editMessageRows');
+  editList.addEventListener('dragstart', e => {
+    const card = e.target.closest('.nlm-msg-card');
+    if (!card) return;
+    dragSrc = card; card.classList.add('is-dragging');
+    e.dataTransfer.effectAllowed = 'move';
+  });
+  editList.addEventListener('dragend', e => {
+    const card = e.target.closest('.nlm-msg-card');
+    if (card) card.classList.remove('is-dragging');
+    dragSrc = null;
+  });
+  editList.addEventListener('dragover', e => {
+    e.preventDefault();
+    const over = e.target.closest('.nlm-msg-card');
+    if (!over || over === dragSrc) return;
+    const rect = over.getBoundingClientRect();
+    const after = (e.clientY - rect.top) > rect.height / 2;
+    editList.insertBefore(dragSrc, after ? over.nextSibling : over);
+  });
+  editList.addEventListener('drop', () => reindexEditRows());
+
+  editList.addEventListener('click', e => {
+    const btn = e.target.closest('.nlm-remove-row');
+    if (!btn || btn.disabled) return;
+    const card = btn.closest('.nlm-msg-card');
+    if (document.querySelectorAll('#editMessageRows .nlm-msg-card').length > 1) {
+      card.remove(); reindexEditRows();
+    }
+  });
+
+  document.getElementById('addEditMessageRow').addEventListener('click', () => {
+    const count = document.querySelectorAll('#editMessageRows .nlm-msg-card').length + 1;
+    editList.appendChild(buildEditRow(count));
+  });
+
+  /* ---------- Snapshot helper for edit history ---------- */
+  function captureEditSnapshot() {
+    const rows = document.querySelectorAll('#editMessageRows .nlm-msg-card');
+    const snap = [];
+    rows.forEach((row, i) => {
+      const num  = i + 1;
+      const type = row.querySelector('[data-field="msg_type"]').value;
+      const text = row.querySelector('[data-field="message"]').value;
+      const file = row.querySelector('[data-field="file_hidden"]').value;
+      const delay = row.querySelector('[data-field="delay"]').value;
+      snap.push({ message_num: num, type, text, file, delay });
+    });
+    return snap;
+  }
+
+  function computeEditDiff(oldSnap, newsletterId) {
+    const rows = document.querySelectorAll('#editMessageRows .nlm-msg-card');
+    const changes = [];
+    rows.forEach((row, i) => {
+      const num  = i + 1;
+      const type = row.querySelector('[data-field="msg_type"]').value;
+      const text = row.querySelector('[data-field="message"]').value;
+      const file = row.querySelector('[data-field="file_hidden"]').value || (row.querySelector('[data-field="file"]').files[0] ? '[new file uploaded]' : '');
+      const delay = row.querySelector('[data-field="delay"]').value;
+
+      const old = oldSnap.find(s => s.message_num === num);
+      if (!old) {
+        changes.push({ message_num: num, field: 'message_added', old_value: '', new_value: `Type: ${type}, Delay: ${delay} min` });
+        return;
+      }
+      if (old.text !== text)
+        changes.push({ message_num: num, field: 'message_text', old_value: old.text, new_value: text });
+      if (old.delay !== delay)
+        changes.push({ message_num: num, field: 'delay_minutes', old_value: old.delay + ' min', new_value: delay + ' min' });
+      if (old.type !== type)
+        changes.push({ message_num: num, field: 'msg_type', old_value: old.type, new_value: type });
+      if (old.file !== file)
+        changes.push({ message_num: num, field: 'file', old_value: old.file || '(none)', new_value: file || '(none)' });
+    });
+    return changes;
+  }
+
+  /* ---------- Card actions (event delegation) ---------- */
+  document.getElementById('nlmGrid').addEventListener('click', e => {
+    const btn = e.target.closest('[data-action]');
+    if (!btn) return;
+    const action = btn.dataset.action;
+    const id = parseInt(btn.dataset.id, 10);
+    const nl = NEWSLETTERS.find(n => n.id === id);
+    if (!nl && action !== 'history') return;
+
+    if (action === 'view')       openViewModal(nl);
+    else if (action === 'edit')  openEditModal(nl);
+    else if (action === 'history') openHistoryModal(id);
+    else if (action === 'stop')  confirmStop(nl);
+    else if (action === 'delete') confirmDelete(nl);
+  });
+
+  /* ---------- View modal (fetches recipients) ---------- */
+  function openViewModal(nl) {
+    document.getElementById('nlmViewId').textContent = `#${nl.id}`;
+    document.getElementById('nlmViewBody').innerHTML = `
+      <div style="text-align:center;padding:40px;">
+        <i class="material-icons" style="font-size:36px;color:var(--nl-muted);animation:nlSpin 1s linear infinite;">progress_activity</i>
+        <div style="margin-top:12px;color:var(--nl-muted);">Loading recipients…</div>
+      </div>`;
+    openModal('nlmViewModal');
+
+    fetch(SITE_URL + 'requests/multi_newsletter_users_new.php', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: new URLSearchParams({ newsletter_id: nl.id })
+    })
+    .then(r => r.text())
+    .then(html => {
+      document.getElementById('nlmViewBody').innerHTML = html || '<div class="nlm-empty">No recipients</div>';
+    })
+    .catch(() => {
+      document.getElementById('nlmViewBody').innerHTML = '<div class="nlm-empty">Failed to load recipients</div>';
+    });
+  }
+
+  /* ---------- Edit modal ---------- */
+  function openEditModal(nl) {
+    document.getElementById('nlmEditId').textContent = `#${nl.id}`;
+    document.getElementById('editNewsletterId').val = nl.id;
+    document.getElementById('editNewsletterId').setAttribute('value', nl.id);
+    document.getElementById('editIndex').value = nl.id;
+
+    const fkSelect = document.getElementById('editFakeUser');
+    fkSelect.value = nl.fake_user_id;
+    if (window.jQuery) $(fkSelect).trigger('change');
+
+    editList.innerHTML = '';
+    fetch(`${SITE_URL}requests/multi_newsletter_users_new.php?action=view_newsletter&id=${nl.id}`)
+      .then(r => r.json())
+      .then(data => {
+        if (!data || !data.messages) {
+          editList.appendChild(buildEditRow(1));
+          preEditSnapshot = captureEditSnapshot();
+          return;
+        }
+        data.messages.forEach((m, i) => {
+          let messageData = {};
+          try { messageData = m.message_text ? JSON.parse(m.message_text) : {}; } catch (e) {}
+          editList.appendChild(buildEditRow(i+1, {
+            type: m.msg_type,
+            text: messageData.text || '',
+            image: messageData.image || '',
+            delay: m.delay_minutes ?? 0,
+          }));
+        });
+        if (data.messages.length === 0) editList.appendChild(buildEditRow(1));
+        /* Capture snapshot AFTER rows are rendered */
+        preEditSnapshot = captureEditSnapshot();
+      })
+      .catch(() => {
+        editList.appendChild(buildEditRow(1));
+        preEditSnapshot = captureEditSnapshot();
+        toast('Failed to load message details', 'error');
+      });
+
+    openModal('nlmEditModal');
+  }
+
+  /* ======================================================================
+   * HISTORY MODAL
+   * ====================================================================== */
+  function openHistoryModal(newsletterId) {
+    document.getElementById('nlmHistoryId').textContent = `#${newsletterId}`;
+    document.getElementById('nlmHistoryBody').innerHTML = `
+      <div style="text-align:center;padding:40px;">
+        <i class="material-icons" style="font-size:36px;color:var(--nl-muted);animation:nlSpin 1s linear infinite;">progress_activity</i>
+        <div style="margin-top:12px;color:var(--nl-muted);">Loading edit history…</div>
+      </div>`;
+    openModal('nlmHistoryModal');
+
+    fetch(AJAX_URL, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: new URLSearchParams({ action: 'edit_history', newsletter_id: newsletterId })
+    })
+    .then(r => r.json())
+    .then(res => {
+      const body = document.getElementById('nlmHistoryBody');
+      if (res.status !== 'success') {
+        body.innerHTML = '<div class="nlm-history__empty"><i class="material-icons">error_outline</i><p>Failed to load history.</p></div>';
+        return;
+      }
+      if (!res.history || res.history.length === 0) {
+        body.innerHTML = '<div class="nlm-history__empty"><i class="material-icons">history</i><h3 style="margin:6px 0;">No edits recorded</h3><p>This newsletter has not been edited yet.</p></div>';
+        return;
+      }
+      body.innerHTML = '<div class="nlm-history">' + res.history.map(renderHistoryEntry).join('') + '</div>';
+    })
+    .catch(() => {
+      document.getElementById('nlmHistoryBody').innerHTML = '<div class="nlm-history__empty"><i class="material-icons">error_outline</i><p>Network error.</p></div>';
+    });
+  }
+
+  function renderHistoryEntry(entry) {
+    const dateStr = entry.edited_at ? formatDate(entry.edited_at) : 'Unknown date';
+    const editor  = entry.editor_name || 'Unknown';
+    const fieldLabels = {
+      message_text: 'Message Text',
+      delay_minutes: 'Delay',
+      msg_type: 'Message Type',
+      file: 'Attached File',
+      message_added: 'Message Added',
+      fake_user: 'Sender (Fake User)',
+    };
+
+    let changesHtml = entry.changes.map(ch => {
+      const label = fieldLabels[ch.field_changed] || ch.field_changed;
+      const badge = `<span class="nlm-history__change-badge">Msg #${ch.message_num || '?'}</span>`;
+
+      if (ch.field_changed === 'message_added') {
+        return `<div class="nlm-history__change">
+          <div class="nlm-history__change-header">${badge} <strong>${label}</strong></div>
+          <div class="nlm-history__diff">
+            <div>
+              <div class="nlm-history__diff-label nlm-history__diff-label--new">Added</div>
+              <div class="nlm-history__diff-value nlm-history__diff-value--new">${escHtml(ch.new_value || '(no details)')}</div>
+            </div>
+          </div>
+        </div>`;
+      }
+
+      const oldDisplay = ch.old_value ? escHtml(truncate(ch.old_value, 500)) : '<em style="color:var(--nl-muted);">(empty)</em>';
+      const newDisplay = ch.new_value ? escHtml(truncate(ch.new_value, 500)) : '<em style="color:var(--nl-muted);">(empty)</em>';
+
+      return `<div class="nlm-history__change">
+        <div class="nlm-history__change-header">${badge} <strong>${label}</strong></div>
+        <div class="nlm-history__diff">
+          <div>
+            <div class="nlm-history__diff-label nlm-history__diff-label--old">Before</div>
+            <div class="nlm-history__diff-value nlm-history__diff-value--old">${oldDisplay}</div>
+          </div>
+          <div>
+            <div class="nlm-history__diff-label nlm-history__diff-label--new">After</div>
+            <div class="nlm-history__diff-value nlm-history__diff-value--new">${newDisplay}</div>
+          </div>
+        </div>
+      </div>`;
+    }).join('');
+
+    return `<div class="nlm-history__entry">
+      <div class="nlm-history__dot"><i class="material-icons" style="font-size:13px;">edit</i></div>
+      <div class="nlm-history__meta">
+        <span class="nlm-history__date">${dateStr}</span>
+        <span class="nlm-history__editor">by <strong>${escHtml(editor)}</strong></span>
+        <span style="font-size:.72rem;color:var(--nl-muted);margin-left:auto;">${entry.changes.length} change${entry.changes.length > 1 ? 's' : ''}</span>
+      </div>
+      ${changesHtml}
+    </div>`;
+  }
+
+  function formatDate(dateStr) {
+    try {
+      const d = new Date(dateStr + 'Z');
+      const now = new Date();
+      const diffMs = now - d;
+      const diffMin = Math.floor(diffMs / 60000);
+      const diffHr  = Math.floor(diffMs / 3600000);
+      const diffDay = Math.floor(diffMs / 86400000);
+
+      let relative = '';
+      if (diffMin < 1)       relative = 'Just now';
+      else if (diffMin < 60) relative = diffMin + ' min ago';
+      else if (diffHr < 24)  relative = diffHr + ' hr ago';
+      else if (diffDay < 7)  relative = diffDay + ' day' + (diffDay > 1 ? 's' : '') + ' ago';
+      else                   relative = d.toLocaleDateString('en-US', { month:'short', day:'numeric', year:'numeric' });
+
+      const full = d.toLocaleDateString('en-US', {
+        weekday:'short', month:'short', day:'numeric', year:'numeric',
+        hour:'2-digit', minute:'2-digit'
+      });
+      return `${relative} <span style="color:var(--nl-muted);font-weight:400;">(${full})</span>`;
+    } catch(e) { return dateStr; }
+  }
+
+  function truncate(str, max) {
+    if (!str || str.length <= max) return str;
+    return str.substring(0, max) + '…';
+  }
+
+  function escHtml(str) {
+    if (!str) return '';
+    const d = document.createElement('div');
+    d.textContent = str;
+    return d.innerHTML;
+  }
+
+  /* ---------- Stop / Delete confirmations ---------- */
+  function confirmStop(nl) {
+    if (!window.jQuery || !$.confirm) { if (confirm(`Stop newsletter #${nl.id}?`)) doStop(nl); return; }
+    $.confirm({
+      title: 'Confirm Stop',
+      content: `Stop newsletter <strong>#${nl.id}</strong>? All pending messages will be cancelled.`,
+      buttons: { confirm: () => doStop(nl), cancel: () => {} }
+    });
+  }
+  function doStop(nl) {
+    fetch(SITE_URL + 'requests/multi_newsletter_users_new.php', {
+      method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body: new URLSearchParams({ action:'stop_newsletter', id: nl.id })
+    })
+    .then(r => r.json().catch(()=>({status:'error',message:'Invalid response'})))
+    .then(res => {
+      toast(res.message || 'Stopped', res.status==='success'?'success':'error');
+      if (res.status === 'success') setTimeout(() => location.reload(), 1500);
+    });
+  }
+
+  function confirmDelete(nl) {
+    if (!window.jQuery || !$.confirm) { if (confirm(`Delete newsletter #${nl.id}?`)) doDelete(nl); return; }
+    $.confirm({
+      title: 'Confirm Delete',
+      content: `Permanently delete newsletter <strong>#${nl.id}</strong>? This cannot be undone.`,
+      buttons: { confirm: () => doDelete(nl), cancel: () => {} }
+    });
+  }
+  function doDelete(nl) {
+    fetch(SITE_URL + 'requests/multi_newsletter_users_new.php', {
+      method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body: new URLSearchParams({ action:'delete_newsletter', id: nl.id })
+    })
+    .then(r => r.json().catch(()=>({status:'error',message:'Invalid response'})))
+    .then(res => {
+      toast(res.message || 'Deleted', res.status==='success'?'success':'error');
+      if (res.status === 'success') setTimeout(() => location.reload(), 1500);
+    });
+  }
+
+  /* ---------- Save edit handler (with history logging) ---------- */
+  document.getElementById('saveEditNewsletterBtn').addEventListener('click', () => {
+    const rows = document.querySelectorAll('#editMessageRows .nlm-msg-card');
+    let valid = true; let firstError = '';
+    const newsletterId = document.getElementById('editNewsletterId').value;
+
+    rows.forEach((row, i) => {
+      if (!valid) return;
+      const num = i + 1;
+      const type    = row.querySelector('[data-field="msg_type"]').value;
+      const message = row.querySelector('[data-field="message"]').value.trim();
+      const file    = row.querySelector('[data-field="file"]').files[0];
+      const hidden  = row.querySelector('[data-field="file_hidden"]').value;
+      const delay   = row.querySelector('[data-field="delay"]').value;
+
+      if (!delay || delay === '0') {
+        if (message || file || hidden) { firstError = `Set a valid delay for message ${num}`; valid = false; return; }
+      }
+      if (type === 'text' && !message)       { firstError = `Enter text for message ${num}`; valid = false; return; }
+      if (type === 'image' && !file && !hidden) { firstError = `Select file for message ${num}`; valid = false; return; }
+      if (type === 'text_image' && (!message || (!file && !hidden))) { firstError = `Provide text + file for message ${num}`; valid = false; return; }
+      if ((type === 'image' || type === 'text_image') && file) {
+        const ext = file.name.split('.').pop().toLowerCase();
+        if (!VALID_EXTS.includes(ext)) { firstError = `Invalid file type for message ${num}`; valid = false; return; }
+      }
+    });
+
+    if (!valid) { toast(firstError || 'Validation failed', 'error'); return; }
+    if (!$('#editFakeUser').val()) { toast('Please select fake user', 'warn'); return; }
+
+    /* Compute diff BEFORE saving */
+    const editDiff = preEditSnapshot ? computeEditDiff(preEditSnapshot, newsletterId) : [];
+
+    const form = document.getElementById('editNewsletterForm');
+    const formData = new FormData(form);
+    const btn = document.getElementById('saveEditNewsletterBtn');
+    const orig = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = '<i class="material-icons" style="animation:nlSpin 1s linear infinite;">progress_activity</i> Saving...';
+
+    fetch(SITE_URL + 'requests/multi_newsletter_users_new.php', {
+      method:'POST', body: formData
+    })
+    .then(r => r.json().catch(()=>({status:'error',message:'Invalid response'})))
+    .then(res => {
+      toast(res.message || 'Saved', res.status==='success'?'success':'error');
+      if (res.status === 'success') {
+        /* Log the edit history in background */
+        if (editDiff.length > 0) {
+          fetch(AJAX_URL, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            body: new URLSearchParams({
+              action: 'log_edit',
+              newsletter_id: newsletterId,
+              changes: JSON.stringify(editDiff),
+            })
+          }).catch(() => {}); /* silent fail — don't block the user */
+        }
+        closeModal('nlmEditModal');
+        setTimeout(() => location.reload(), 1200);
+      } else {
+        btn.disabled = false;
+        btn.innerHTML = orig;
+      }
+    })
+    .catch(err => {
+      console.error(err);
+      toast('Network error', 'error');
+      btn.disabled = false;
+      btn.innerHTML = orig;
+    });
+  });
+
+  /* ---------- Select2 init ---------- */
+  if (window.jQuery && typeof $.fn.select2 === 'function') {
+    $('.js-example-basic-single').select2({ width:'100%', dropdownAutoWidth:true });
+  }
+
+  /* ---------- Spinner keyframes ---------- */
+  const styleTag = document.createElement('style');
+  styleTag.textContent = '@keyframes nlSpin{to{transform:rotate(360deg)}}';
+  document.head.appendChild(styleTag);
+})();
+</script>
